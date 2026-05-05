@@ -1,0 +1,14 @@
+{
+  "base_url": {
+    "description": "MCSManager 面板地址",
+    "type": "string",
+    "hint": "例如 http://localhost:23333，请勿带末尾斜杠",
+    "default": ""
+  },
+  "api_token": {
+    "description": "MCSManager API 令牌",
+    "type": "string",
+    "hint": "在面板左侧「API 密钥」中生成或查看",
+    "default": ""
+  }
+}
