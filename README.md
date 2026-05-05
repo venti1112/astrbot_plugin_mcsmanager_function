@@ -17,7 +17,7 @@ MCSManagerFunction - AstrBot 插件
 在 AstrBot WebUI 的插件管理中，找到 "MCSManagerFunction"，填写以下配置：
 
 - base_url: MCSManager 面板的访问地址，例如 http://localhost:23333，请勿包含末尾斜杠。
-- api_token: MCSManager 的 API 密钥，在面板左侧 "API 密钥" 中可以生成或查看。
+- api_token: MCSManager 的 API 密钥，在面板的用户管理中，在 "API 密钥" 中可以生成或查看。
 
 保存配置后，插件会自动连接并注册工具。
 
