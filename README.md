@@ -3,7 +3,7 @@ MCSManagerFunction - AstrBot 插件
 
 简介
 ----
-本插件为 AstrBot 提供一系列 MCSManager 面板的 LLM 工具函数，使 Agent 能够直接调用 MCSManager 的 API，实现实例管理、文件操作、日志查看等功能。
+本插件为 AstrBot 提供一系列 MCSManager 面板的工具函数，使 Agent 能够直接调用 MCSManager 的 API，实现实例管理、文件操作、日志查看等功能。
 
 依赖
 ----
