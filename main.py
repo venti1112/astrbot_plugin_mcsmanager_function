@@ -7,8 +7,28 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
+PERMISSION_MODE_ALL = "全部工具仅管理员可用"
+PERMISSION_MODE_DANGEROUS = "仅危险操作需管理员"
+PERMISSION_MODE_OFF = "不校验"
 
-@register("mcsmanager_function", "venti1112", "给 AI 使用的 MCSManager 工具函数", "1.0.0")
+# 危险操作：实例进程控制、控制台命令、文件写/删类操作
+DANGEROUS_TOOLS = {
+    "mcsmanager_start_instance",
+    "mcsmanager_stop_instance",
+    "mcsmanager_restart_instance",
+    "mcsmanager_kill_instance",
+    "mcsmanager_send_command",
+    "mcsmanager_write_file",
+    "mcsmanager_delete_files",
+    "mcsmanager_create_folder",
+    "mcsmanager_compress_files",
+    "mcsmanager_decompress_file",
+    "mcsmanager_copy_files",
+    "mcsmanager_move_files",
+}
+
+
+@register("mcsmanager_function", "venti1112", "给 AI 使用的 MCSManager 工具函数", "1.1.0")
 class MCSManagerFunction(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -80,16 +100,147 @@ class MCSManagerFunction(Star):
                 logger.error(f"MCSManager API 请求失败: {e}")
                 return {"error": str(e)}
 
+    # --- 权限与限制 ---
+    def _blocked_instance_keywords(self) -> list[str]:
+        blocked = self.config.get("blocked_instances", [])
+        if not isinstance(blocked, list):
+            return []
+        return [str(item).strip().lower() for item in blocked if str(item).strip()]
+
+    def _check_tool_permission(
+        self, event: AstrMessageEvent, tool_name: str
+    ) -> Optional[str]:
+        """校验调用者是否为 AstrBot 管理员。放行返回 None，否则返回拒绝信息。"""
+        mode = self.config.get("permission_mode", PERMISSION_MODE_ALL)
+        if mode == PERMISSION_MODE_OFF:
+            return None
+        if mode == PERMISSION_MODE_DANGEROUS and tool_name not in DANGEROUS_TOOLS:
+            return None
+        if event.is_admin():
+            return None
+        sender_id = event.get_sender_id()
+        logger.warning(f"非管理员用户 {sender_id} 尝试调用受限工具 {tool_name}，已拒绝")
+        return json.dumps(
+            {
+                "error": "Permission denied",
+                "detail": (
+                    f"该操作仅限 AstrBot 管理员使用（当前用户 ID: {sender_id}）。"
+                    "请让管理员执行，或由管理员将你的 ID 加入 AstrBot 管理员列表。"
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _extract_instance_name(payload) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        config = data.get("config")
+        if isinstance(config, dict) and isinstance(config.get("nickname"), str):
+            return config["nickname"]
+        nickname = data.get("nickname")
+        if isinstance(nickname, str) and nickname:
+            return nickname
+        return None
+
+    @staticmethod
+    def _blocked_instance_message(uuid: str, name: Optional[str] = None) -> str:
+        target = f"{name} ({uuid})" if name else uuid
+        return json.dumps(
+            {
+                "error": "Instance blocked",
+                "detail": f"实例 {target} 已被列入禁止操作的名单，本次操作已被拒绝。",
+            },
+            ensure_ascii=False,
+        )
+
+    async def _check_instance_allowed(self, daemon_id: str, uuid: str) -> Optional[str]:
+        """校验目标实例是否在禁止名单中。放行返回 None，否则返回拒绝信息。"""
+        keywords = self._blocked_instance_keywords()
+        if not keywords:
+            return None
+        if uuid and uuid.strip().lower() in keywords:
+            return self._blocked_instance_message(uuid)
+        detail = await self._request(
+            "GET", "/api/instance", params={"daemonId": daemon_id, "uuid": uuid}
+        )
+        name = self._extract_instance_name(detail)
+        if name is None:
+            logger.warning(f"无法获取实例 {uuid} 的名称，禁止名单校验失败，保守拒绝本次操作")
+            return json.dumps(
+                {
+                    "error": "Instance check failed",
+                    "detail": (
+                        f"无法确认实例 {uuid} 是否在禁止名单中，已保守拒绝本次操作。"
+                        "请检查 MCSManager 连接后重试。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        lowered = name.strip().lower()
+        if any(keyword in lowered for keyword in keywords):
+            return self._blocked_instance_message(uuid, name)
+        return None
+
+    async def _check_restrictions(
+        self,
+        event: AstrMessageEvent,
+        tool_name: str,
+        daemon_id: Optional[str] = None,
+        uuid: Optional[str] = None,
+    ) -> Optional[str]:
+        """工具调用前的统一校验：管理员权限，以及（传入实例时）实例禁止名单。"""
+        if err := self._check_tool_permission(event, tool_name):
+            return err
+        if daemon_id is not None and uuid is not None:
+            return await self._check_instance_allowed(daemon_id, uuid)
+        return None
+
+    def _filter_blocked_instances(self, payload):
+        keywords = self._blocked_instance_keywords()
+        if not keywords or not isinstance(payload, dict):
+            return payload
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return payload
+        items = data.get("data")
+        if not isinstance(items, list):
+            return payload
+        filtered = []
+        for item in items:
+            if not isinstance(item, dict):
+                filtered.append(item)
+                continue
+            uuid = str(item.get("instanceUuid") or "").strip().lower()
+            config = item.get("config")
+            name = ""
+            if isinstance(config, dict) and isinstance(config.get("nickname"), str):
+                name = config["nickname"].strip().lower()
+            if uuid and uuid in keywords:
+                continue
+            if name and any(keyword in name for keyword in keywords):
+                continue
+            filtered.append(item)
+        data["data"] = filtered
+        return payload
+
     # --- 仪表盘 / 节点 ---
     @filter.llm_tool(name="mcsmanager_get_overview")
     async def mcsmanager_get_overview(self, event: AstrMessageEvent) -> str:
         """获取 MCSManager 面板的全局概览信息，包括版本、CPU/内存、节点状态等。"""
+        if err := await self._check_restrictions(event, "mcsmanager_get_overview"):
+            return err
         data = await self._request("GET", "/api/overview")
         return json.dumps(data, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="mcsmanager_get_daemon_list")
     async def mcsmanager_get_daemon_list(self, event: AstrMessageEvent) -> str:
         """获取所有已连接的节点（守护进程）列表及其基本状态。"""
+        if err := await self._check_restrictions(event, "mcsmanager_get_daemon_list"):
+            return err
         data = await self._request("GET", "/api/overview")
         remotes = data.get("data", {}).get("remote", [])
         return json.dumps(remotes, ensure_ascii=False, indent=2)
@@ -114,6 +265,8 @@ class MCSManagerFunction(Star):
             instance_name(string, optional): 按实例名称模糊搜索。
             status(string, optional): 按状态过滤（running, stopped 等）。
         """
+        if err := await self._check_restrictions(event, "mcsmanager_get_instances"):
+            return err
         params = {
             "daemonId": daemon_id,
             "page": page,
@@ -126,6 +279,7 @@ class MCSManagerFunction(Star):
         data = await self._request(
             "GET", "/api/service/remote_service_instances", params=params
         )
+        data = self._filter_blocked_instances(data)
         return json.dumps(data, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="mcsmanager_get_instance_detail")
@@ -138,6 +292,10 @@ class MCSManagerFunction(Star):
             daemon_id(string): 节点 ID。
             uuid(string): 实例 UUID。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_get_instance_detail", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "GET", "/api/instance", params={"daemonId": daemon_id, "uuid": uuid}
         )
@@ -153,6 +311,10 @@ class MCSManagerFunction(Star):
             daemon_id(string): 节点 ID。
             uuid(string): 实例 UUID。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_start_instance", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "GET",
             "/api/protected_instance/open",
@@ -170,6 +332,10 @@ class MCSManagerFunction(Star):
             daemon_id(string): 节点 ID。
             uuid(string): 实例 UUID。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_stop_instance", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "GET",
             "/api/protected_instance/stop",
@@ -187,6 +353,10 @@ class MCSManagerFunction(Star):
             daemon_id(string): 节点 ID。
             uuid(string): 实例 UUID。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_restart_instance", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "GET",
             "/api/protected_instance/restart",
@@ -204,6 +374,10 @@ class MCSManagerFunction(Star):
             daemon_id(string): 节点 ID。
             uuid(string): 实例 UUID。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_kill_instance", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "GET",
             "/api/protected_instance/kill",
@@ -222,6 +396,10 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             command(string): 要执行的命令。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_send_command", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "GET",
             "/api/protected_instance/command",
@@ -244,6 +422,10 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             size(int, optional): 日志大小（KB），不填则返回全部。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_get_instance_log", daemon_id, uuid
+        ):
+            return err
         params = {"daemonId": daemon_id, "uuid": uuid}
         if size is not None:
             params["size"] = size
@@ -275,6 +457,10 @@ class MCSManagerFunction(Star):
             page(int): 页码，默认 1。
             page_size(int): 每页数量，默认 50。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_list_files", daemon_id, uuid
+        ):
+            return err
         # 修复：守护进程要求 target 不能以 / 开头，否则会导致路径重复叠加（如 /data/.../data/...）
         # 将其规范化为相对路径
         target = target.strip()
@@ -307,6 +493,10 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             target(string): 文件完整路径。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_read_file", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "PUT",
             "/api/files/",
@@ -332,6 +522,10 @@ class MCSManagerFunction(Star):
             target(string): 文件完整路径。
             text(string): 要写入的文本内容。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_write_file", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "PUT",
             "/api/files/",
@@ -355,6 +549,21 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             targets(list): 要删除的文件或文件夹路径列表，例如 ["/a.txt", "/dir"]。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_delete_files", daemon_id, uuid
+        ):
+            return err
+        root_targets = [
+            target for target in targets if target.strip().strip("/") in ("", ".")
+        ]
+        if root_targets:
+            return json.dumps(
+                {
+                    "error": "Dangerous operation rejected",
+                    "detail": f"禁止删除实例根目录，已拒绝目标: {root_targets}",
+                },
+                ensure_ascii=False,
+            )
         data = await self._request(
             "DELETE",
             "/api/files",
@@ -374,6 +583,10 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             target(string): 要创建的文件夹路径。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_create_folder", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "POST",
             "/api/files/mkdir",
@@ -399,6 +612,10 @@ class MCSManagerFunction(Star):
             source(string): 压缩包保存路径，例如 "/backup.zip"。
             targets(list): 要压缩的文件或文件夹路径列表。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_compress_files", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "POST",
             "/api/files/compress",
@@ -424,6 +641,10 @@ class MCSManagerFunction(Star):
             source(string): 压缩包路径，例如 "/backup.zip"。
             targets(string): 解压目标文件夹路径，例如 "/restore/"。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_decompress_file", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "POST",
             "/api/files/compress",
@@ -447,6 +668,10 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             targets(list): 源路径与目标路径的列表，例如 [["/a.txt", "/backup/a.txt"]]。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_copy_files", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "POST",
             "/api/files/copy",
@@ -470,6 +695,10 @@ class MCSManagerFunction(Star):
             uuid(string): 实例 UUID。
             targets(list): 旧路径与新路径的列表，例如 [["/old.txt", "/new.txt"]]。
         """
+        if err := await self._check_restrictions(
+            event, "mcsmanager_move_files", daemon_id, uuid
+        ):
+            return err
         data = await self._request(
             "PUT",
             "/api/files/move",
