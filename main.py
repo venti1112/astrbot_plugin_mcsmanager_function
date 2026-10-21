@@ -7,25 +7,11 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-PERMISSION_MODE_ALL = "全部工具仅管理员可用"
-PERMISSION_MODE_DANGEROUS = "仅危险操作需管理员"
-PERMISSION_MODE_OFF = "不校验"
-
-# 危险操作：实例进程控制、控制台命令、文件写/删类操作
-DANGEROUS_TOOLS = {
-    "mcsmanager_start_instance",
-    "mcsmanager_stop_instance",
-    "mcsmanager_restart_instance",
-    "mcsmanager_kill_instance",
-    "mcsmanager_send_command",
-    "mcsmanager_write_file",
-    "mcsmanager_delete_files",
-    "mcsmanager_create_folder",
-    "mcsmanager_compress_files",
-    "mcsmanager_decompress_file",
-    "mcsmanager_copy_files",
-    "mcsmanager_move_files",
-}
+PERMISSION_EVERYONE = "所有人"
+PERMISSION_ADMIN = "仅管理员"
+PERMISSION_DISABLED = "禁用"
+DEFAULT_TOOL_PERMISSION = PERMISSION_ADMIN
+TOOL_PERMISSION_OPTIONS = (PERMISSION_EVERYONE, PERMISSION_ADMIN, PERMISSION_DISABLED)
 
 
 @register("mcsmanager_function", "venti1112", "给 AI 使用的 MCSManager 工具函数", "1.1.0")
@@ -107,18 +93,36 @@ class MCSManagerFunction(Star):
             return []
         return [str(item).strip().lower() for item in blocked if str(item).strip()]
 
+    def _tool_permission(self, tool_name: str) -> str:
+        permissions = self.config.get("tool_permissions", {})
+        if not isinstance(permissions, dict):
+            return DEFAULT_TOOL_PERMISSION
+        permission = permissions.get(tool_name, DEFAULT_TOOL_PERMISSION)
+        if permission not in TOOL_PERMISSION_OPTIONS:
+            return DEFAULT_TOOL_PERMISSION
+        return permission
+
     def _check_tool_permission(
         self, event: AstrMessageEvent, tool_name: str
     ) -> Optional[str]:
-        """校验调用者是否为 AstrBot 管理员。放行返回 None，否则返回拒绝信息。"""
-        mode = self.config.get("permission_mode", PERMISSION_MODE_ALL)
-        if mode == PERMISSION_MODE_OFF:
-            return None
-        if mode == PERMISSION_MODE_DANGEROUS and tool_name not in DANGEROUS_TOOLS:
-            return None
-        if event.is_admin():
+        """根据工具权限配置校验调用者。放行返回 None，否则返回拒绝信息。"""
+        permission = self._tool_permission(tool_name)
+        if permission == PERMISSION_EVERYONE:
             return None
         sender_id = event.get_sender_id()
+        if permission == PERMISSION_DISABLED:
+            logger.warning(f"工具 {tool_name} 已被禁用，拒绝用户 {sender_id} 的调用")
+            return json.dumps(
+                {
+                    "error": "Tool disabled",
+                    "detail": (
+                        f"工具 {tool_name} 已被管理员禁用，任何人（包括管理员）都无法使用。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        if event.is_admin():
+            return None
         logger.warning(f"非管理员用户 {sender_id} 尝试调用受限工具 {tool_name}，已拒绝")
         return json.dumps(
             {

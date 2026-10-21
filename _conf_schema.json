@@ -11,12 +11,126 @@
     "hint": "在面板用户管理中，「API 密钥」中生成或查看",
     "default": ""
   },
-  "permission_mode": {
+  "tool_permissions": {
     "description": "工具权限控制",
-    "type": "string",
-    "options": ["全部工具仅管理员可用", "仅危险操作需管理员", "不校验"],
-    "hint": "控制哪些用户可以通过 AI 调用本插件工具。「管理员」指 AstrBot 全局配置中的管理员。危险操作包括：启动/停止/重启/强杀实例、发送控制台命令，以及写入/删除/新建/压缩/解压/复制/移动文件。",
-    "default": "全部工具仅管理员可用"
+    "type": "object",
+    "hint": "为每个工具单独设置权限：所有人 = 任何用户可用；仅管理员 = 仅 AstrBot 管理员可用；禁用 = 任何人都不能使用（包括管理员）。「管理员」指 AstrBot 全局配置中的管理员。",
+    "items": {
+      "mcsmanager_get_overview": {
+        "description": "获取面板全局概览",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_get_daemon_list": {
+        "description": "获取节点列表",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_get_instances": {
+        "description": "获取实例列表",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_get_instance_detail": {
+        "description": "获取实例详情",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_start_instance": {
+        "description": "启动实例",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_stop_instance": {
+        "description": "停止实例",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_restart_instance": {
+        "description": "重启实例",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_kill_instance": {
+        "description": "强制终止实例",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_send_command": {
+        "description": "发送控制台命令",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_get_instance_log": {
+        "description": "获取实例日志",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_list_files": {
+        "description": "列出文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_read_file": {
+        "description": "读取文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_write_file": {
+        "description": "写入文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_delete_files": {
+        "description": "删除文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_create_folder": {
+        "description": "新建文件夹",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_compress_files": {
+        "description": "压缩文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_decompress_file": {
+        "description": "解压文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_copy_files": {
+        "description": "复制文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
+      "mcsmanager_move_files": {
+        "description": "移动或重命名文件",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      }
+    }
   },
   "blocked_instances": {
     "description": "禁止操作的实例",
