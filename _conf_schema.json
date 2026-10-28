@@ -28,6 +28,12 @@
         "options": ["所有人", "仅管理员", "禁用"],
         "default": "仅管理员"
       },
+      "mcsmanager_node_bash": {
+        "description": "节点终端执行 bash",
+        "type": "string",
+        "options": ["所有人", "仅管理员", "禁用"],
+        "default": "仅管理员"
+      },
       "mcsmanager_get_instances": {
         "description": "获取实例列表",
         "type": "string",
@@ -135,7 +141,25 @@
   "blocked_instances": {
     "description": "禁止操作的实例",
     "type": "list",
-    "hint": "填写实例 UUID 或名称关键词（子串匹配，忽略大小写），每行一个。被列入的实例对 AI 完全隐藏，且拒绝一切针对它的操作（对管理员同样生效）。",
+    "hint": "填写实例 UUID 或名称关键词（子串匹配，忽略大小写），每行一个。被列入的实例对 AI 完全隐藏，且拒绝一切针对它的操作（对管理员同样生效）。填写节点 ID 可封锁该节点的节点终端。",
+    "default": []
+  },
+  "bash_timeout": {
+    "description": "节点命令默认超时（秒）",
+    "type": "int",
+    "hint": "mcsmanager_node_bash 等待命令输出的上限，5~300 秒。命令仍在执行时会返回已完成的部分输出。",
+    "default": 30
+  },
+  "bash_max_output": {
+    "description": "节点命令输出上限（字符）",
+    "type": "int",
+    "hint": "超过该长度的输出会在中间截断，保留首尾两段，避免撑爆模型上下文。",
+    "default": 8000
+  },
+  "bash_blocked_commands": {
+    "description": "禁止执行的命令规则",
+    "type": "list",
+    "hint": "每行一条规则，按正则匹配（忽略大小写），正则非法时按子串匹配。例如 rm\\s+-rf\\s+/、reboot、shutdown。默认不限制。",
     "default": []
   }
 }

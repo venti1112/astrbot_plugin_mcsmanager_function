@@ -1,5 +1,10 @@
+import asyncio
 import json
+import re
+import shlex
+import time
 from typing import Optional, Union
+from uuid import uuid4
 import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -13,14 +18,43 @@ PERMISSION_DISABLED = "禁用"
 DEFAULT_TOOL_PERMISSION = PERMISSION_ADMIN
 TOOL_PERMISSION_OPTIONS = (PERMISSION_EVERYONE, PERMISSION_ADMIN, PERMISSION_DISABLED)
 
+# MCSManager 面板的「节点终端」在 daemon 侧是一个固定的特殊实例（type=universal，
+# startCommand=bash，cwd=/），uuid 与昵称固定，靠普通实例接口即可驱动。
+NODE_TERMINAL_UUID = "global0001"
+NODE_TERMINAL_NAME = "__MCSM_GLOBAL_INSTANCE__"
 
-@register("mcsmanager_function", "venti1112", "给 AI 使用的 MCSManager 工具函数", "1.1.0")
+INSTANCE_STATUS_STOP = 0
+INSTANCE_STATUS_STOPPING = 1
+INSTANCE_STATUS_STARTING = 2
+INSTANCE_STATUS_RUNNING = 3
+
+# 节点终端启动等待上限（秒）
+NODE_TERMINAL_BOOT_TIMEOUT = 20
+# 可直接塞进 URL 查询串的脚本长度上限，超过则先落盘为临时脚本再执行
+BASH_INLINE_LIMIT = 3500
+# 读取节点终端日志时的窗口大小（MCSManager 侧日志文件上限约 512KB）
+BASH_LOG_WINDOW = "512kb"
+DEFAULT_BASH_TIMEOUT = 30
+DEFAULT_BASH_MAX_OUTPUT = 8000
+
+# ANSI 控制序列（颜色、光标移动、OSC 等），节点终端可能在 pty 模式下运行
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC
+    r"|\x1b[()][0-9A-Za-z]"  # 字符集切换
+    r"|\x1b[=>]"  # 单字符转义
+)
+
+
+@register("mcsmanager_function", "venti1112", "给 AI 使用的 MCSManager 工具函数", "1.0.3")
 class MCSManagerFunction(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.base_url = self.config.get("base_url", "").rstrip("/")
         self.api_token = self.config.get("api_token", "")
+        # 同一节点上的命令串行执行，避免多个调用共用同一个 shell 时输出互相穿插
+        self._bash_locks: dict[str, asyncio.Lock] = {}
         logger.info(f"MCSManager 地址: {self.base_url}")
         logger.info("MCSManager API 令牌: 已设置" if self.api_token else "MCSManager API 令牌: 未设置")
 
@@ -231,6 +265,321 @@ class MCSManagerFunction(Star):
         data["data"] = filtered
         return payload
 
+    # --- 节点终端（bash）---
+    def _bash_timeout(self) -> int:
+        try:
+            value = int(self.config.get("bash_timeout", DEFAULT_BASH_TIMEOUT))
+        except (TypeError, ValueError):
+            value = DEFAULT_BASH_TIMEOUT
+        return max(5, min(value, 300))
+
+    def _bash_max_output(self) -> int:
+        try:
+            value = int(self.config.get("bash_max_output", DEFAULT_BASH_MAX_OUTPUT))
+        except (TypeError, ValueError):
+            value = DEFAULT_BASH_MAX_OUTPUT
+        return max(500, value)
+
+    def _bash_blocked_patterns(self) -> list[str]:
+        patterns = self.config.get("bash_blocked_commands", [])
+        if not isinstance(patterns, list):
+            return []
+        return [str(item).strip() for item in patterns if str(item).strip()]
+
+    def _check_bash_command(self, command: str) -> Optional[str]:
+        """按黑名单规则校验命令。命中返回拒绝信息，否则返回 None。
+
+        规则优先按正则匹配（忽略大小写）；正则非法时退化为子串匹配。
+        """
+        for pattern in self._bash_blocked_patterns():
+            try:
+                hit = re.search(pattern, command, re.IGNORECASE) is not None
+            except re.error:
+                hit = pattern.lower() in command.lower()
+            if hit:
+                logger.warning(f"节点 bash 命令命中黑名单规则 {pattern!r}，已拒绝执行")
+                return json.dumps(
+                    {
+                        "error": "Command blocked",
+                        "detail": f"命令命中管理员配置的黑名单规则「{pattern}」，已拒绝执行。",
+                    },
+                    ensure_ascii=False,
+                )
+        return None
+
+    def _check_blocked_daemon(self, daemon_id: str) -> Optional[str]:
+        """节点是否可以操作。blocked_instances 中填节点 ID 即封锁整个节点。"""
+        keywords = self._blocked_instance_keywords()
+        if daemon_id and daemon_id.strip().lower() in keywords:
+            logger.warning(f"节点 {daemon_id} 已被列入禁止名单，拒绝执行命令")
+            return json.dumps(
+                {
+                    "error": "Daemon blocked",
+                    "detail": f"节点 {daemon_id} 已被列入禁止操作的名单，本次操作已被拒绝。",
+                },
+                ensure_ascii=False,
+            )
+        return None
+
+    @staticmethod
+    def _json_error(error: str, detail: str) -> str:
+        return json.dumps({"error": error, "detail": detail}, ensure_ascii=False)
+
+    async def _node_terminal_status(
+        self, daemon_id: str, uuid: str
+    ) -> tuple[Optional[int], str]:
+        """读取节点终端状态。返回 (status, 原始响应摘要)。"""
+        payload = await self._request(
+            "GET", "/api/instance", params={"daemonId": daemon_id, "uuid": uuid}
+        )
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            try:
+                return int(data.get("status")), ""
+            except (TypeError, ValueError):
+                pass
+        snippet = (
+            json.dumps(payload, ensure_ascii=False)
+            if isinstance(payload, dict)
+            else str(payload)
+        )
+        return None, snippet[:500]
+
+    async def _find_node_terminal(self, daemon_id: str) -> Optional[str]:
+        """定位节点终端实例的 UUID。优先用固定 UUID，失败时回落到实例列表搜索。"""
+        status, _ = await self._node_terminal_status(daemon_id, NODE_TERMINAL_UUID)
+        if status is not None:
+            return NODE_TERMINAL_UUID
+        payload = await self._request(
+            "GET",
+            "/api/service/remote_service_instances",
+            params={"daemonId": daemon_id, "page": 1, "page_size": 200},
+        )
+        items = payload.get("data", {}).get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("instanceUuid") or "") == NODE_TERMINAL_UUID:
+                return NODE_TERMINAL_UUID
+            config = item.get("config")
+            if isinstance(config, dict) and config.get("nickname") == NODE_TERMINAL_NAME:
+                return str(item.get("instanceUuid") or "") or None
+        return None
+
+    async def _ensure_node_terminal(
+        self, daemon_id: str
+    ) -> tuple[Optional[str], Optional[str], bool]:
+        """确保节点终端处于运行状态。返回 (uuid, 错误信息, 是否本次冷启动)。"""
+        uuid = await self._find_node_terminal(daemon_id)
+        if not uuid:
+            return None, self._json_error(
+                "Node terminal not found",
+                "未在该节点上找到「节点终端」（实例 UUID 应为 global0001）。"
+                "请确认 MCSManager 版本支持节点终端，且当前 API 密钥的用户有权访问该实例。",
+            ), False
+
+        status, raw = await self._node_terminal_status(daemon_id, uuid)
+        if status == INSTANCE_STATUS_RUNNING:
+            return uuid, None, False
+        if status is None:
+            return None, self._json_error(
+                "Node terminal unavailable",
+                f"无法读取节点终端状态，请检查 MCSManager 连接与权限。原始响应: {raw}",
+            ), False
+
+        deadline = time.monotonic() + NODE_TERMINAL_BOOT_TIMEOUT
+        opened = False
+        current = status
+        while time.monotonic() < deadline:
+            if current == INSTANCE_STATUS_RUNNING:
+                return uuid, None, opened
+            if current == INSTANCE_STATUS_STOP and not opened:
+                resp = await self._request(
+                    "GET",
+                    "/api/protected_instance/open",
+                    params={"daemonId": daemon_id, "uuid": uuid},
+                )
+                if isinstance(resp, dict) and resp.get("error"):
+                    return None, self._json_error(
+                        "Node terminal start failed",
+                        f"启动节点终端失败: {json.dumps(resp, ensure_ascii=False)}",
+                    ), False
+                opened = True
+                logger.info(f"已请求启动节点 {daemon_id} 的节点终端")
+            await asyncio.sleep(0.4)
+            current, _ = await self._node_terminal_status(daemon_id, uuid)
+
+        if current == INSTANCE_STATUS_RUNNING:
+            return uuid, None, opened
+        return None, self._json_error(
+            "Node terminal start timeout",
+            f"节点终端在 {NODE_TERMINAL_BOOT_TIMEOUT} 秒内未就绪（当前状态码: {current}）。",
+        ), False
+
+    async def _read_node_terminal_log(self, daemon_id: str, uuid: str) -> Optional[str]:
+        text = await self._request(
+            "GET",
+            "/api/protected_instance/outputlog",
+            params={"daemonId": daemon_id, "uuid": uuid, "size": BASH_LOG_WINDOW},
+            raw_text=True,
+        )
+        if not isinstance(text, str):
+            return None
+        # 日志文件不存在时，面板会把 daemon 的异常对象序列化成 {} 返回
+        if text.strip() in ("", "{}", "null"):
+            return None
+        return text
+
+    async def _probe_node_terminal(
+        self, daemon_id: str, uuid: str, timeout: float = 15.0
+    ) -> tuple[bool, int]:
+        """确认节点终端真的能接收并执行输入，返回 (是否就绪, 探针次数)。
+
+        节点终端默认跑在 pty 模式：daemon 侧的 pty helper 要过一会儿才接管 stdin，
+        交互式 bash 初始化 readline 时还会丢掉已缓冲的输入。刚 open 完立刻写命令
+        会整段落空，因此冷启动后必须先用无副作用的探针把终端「叫醒」。
+        探针里的标记刻意拆成两段字符串，pty 回显的是 `'__MCSM_READY_' 'xxx__'`，
+        只有真正执行后才会出现连续的标记，避免把回显误判成执行成功。
+        """
+        token = uuid4().hex[:12]
+        marker = f"__MCSM_READY_{token}__"
+        probe = f"printf '\\n%s%s\\n' '__MCSM_READY_' '{token}__'"
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            await self._request(
+                "GET",
+                "/api/protected_instance/command",
+                params={"daemonId": daemon_id, "uuid": uuid, "command": probe},
+            )
+            echo_deadline = min(deadline, time.monotonic() + 1.2)
+            while time.monotonic() < echo_deadline:
+                text = await self._read_node_terminal_log(daemon_id, uuid)
+                if text and marker in text:
+                    logger.info(
+                        f"节点 {daemon_id} 的节点终端已就绪（探针第 {attempts} 次命中）"
+                    )
+                    return True, attempts
+                await asyncio.sleep(0.2)
+        return False, attempts
+
+    async def _upload_script(
+        self, daemon_id: str, uuid: str, token: str, script: str
+    ) -> Optional[tuple[str, str]]:
+        """把脚本写到节点 /tmp，返回 (执行命令, 脚本路径)；失败返回 None。
+
+        pty 模式会把送进去的每一行原样回显，若把多行脚本直接写进终端，
+        输出会被「提示符 + 命令原文」塞满。落盘后用 source 执行，只会回显一行，
+        同时 source 在当前 shell 里运行，cd / export 依然能跨调用保留。
+        """
+        target = f"/tmp/mcsm_ai_{token}.sh"
+        written = await self._request(
+            "PUT",
+            "/api/files/",
+            params={"daemonId": daemon_id, "uuid": uuid},
+            json_data={"target": target, "text": script},
+        )
+        failed = None
+        if isinstance(written, dict):
+            if written.get("error"):
+                failed = written
+            elif isinstance(written.get("status"), int) and written["status"] != 200:
+                failed = written
+        if failed is not None:
+            logger.warning(
+                f"写入节点临时脚本失败，回退为直接执行: {json.dumps(failed, ensure_ascii=False)}"
+            )
+            return None
+        quoted = shlex.quote(target)
+        # 命令末尾的 rm 负责兜底清理（命令中途 exit 时也能删掉）
+        return f". {quoted}; rm -f {quoted}", target
+
+    async def _delete_temp_script(self, daemon_id: str, uuid: str, target: str) -> None:
+        """主动删除临时脚本，避免依赖 shell 里的 rm 带来的时序漂移。"""
+        resp = await self._request(
+            "DELETE",
+            "/api/files",
+            params={"daemonId": daemon_id, "uuid": uuid},
+            json_data={"targets": [target]},
+        )
+        if isinstance(resp, dict) and resp.get("error"):
+            logger.warning(
+                f"删除节点临时脚本失败 {target}: {json.dumps(resp, ensure_ascii=False)}"
+            )
+
+    @staticmethod
+    def _build_bash_script(token: str, command: str, workdir: Optional[str]) -> str:
+        """拼装带起止标记的脚本。
+
+        标记由脚本自己打印，因此不依赖日志偏移量；用户命令保持顶层执行，
+        这样 cd / export 等会作用在同一个 shell 会话上，跨调用保留状态。
+
+        标记在命令文本里被拆成两段字符串传给 printf，因为 pty 模式会把命令行
+        原样回显到输出里：若标记整体出现在命令文本中，回显也会被识别成标记，
+        一旦回显与真实输出交错就会切出错乱甚至空的结果。
+        """
+        lines = [f"printf '\\n%s%s\\n' '__MCSM_BASH_BEGIN_' '{token}__'"]
+        if workdir:
+            quoted = shlex.quote(workdir)
+            lines.append(
+                f"cd -- {quoted} || {{ printf '[mcsmanager] 切换到 %s 失败，继续在当前目录执行\\n' \"$PWD\"; }}"
+            )
+        lines.append(command)
+        lines.append(
+            f"printf '\\n%s%s:%s\\n' '__MCSM_BASH_END_' '{token}__' \"$?\""
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_bash_result(text: str, token: str) -> tuple[Optional[str], Optional[int]]:
+        begin = f"__MCSM_BASH_BEGIN_{token}__"
+        end = f"__MCSM_BASH_END_{token}__:"
+        start = text.rfind(begin)
+        if start < 0:
+            return None, None
+        rest = text[start + len(begin) :]
+        stop = rest.find(end)
+        if stop < 0:
+            return None, None
+        tail = rest[stop + len(end) :]
+        match = re.match(r"\s*(-?\d+)", tail)
+        return rest[:stop], int(match.group(1)) if match else None
+
+    @staticmethod
+    def _extract_partial_output(text: str, token: str) -> str:
+        """超时/中断时取本次命令已产生的输出（从本次的起始标记之后开始）。"""
+        begin = f"__MCSM_BASH_BEGIN_{token}__"
+        start = text.rfind(begin)
+        return text[start + len(begin) :] if start >= 0 else text
+
+    @staticmethod
+    def _clean_terminal_text(text: str) -> str:
+        text = ANSI_ESCAPE_RE.sub("", text)
+        text = text.replace("\r\n", "\n").replace("\r", "")
+        # pty 模式会把结束标记那条 printf 命令回显出来（字面量里带单引号），
+        # 真实输出只含连续标记，因此带引号的整行都可以丢掉
+        if "'__MCSM_BASH_END_'" in text:
+            text = "\n".join(
+                line
+                for line in text.split("\n")
+                if "'__MCSM_BASH_END_'" not in line
+            )
+        return text.strip("\n")
+
+    @staticmethod
+    def _truncate_output(text: str, limit: int) -> tuple[str, bool]:
+        if len(text) <= limit:
+            return text, False
+        half = limit // 2
+        omitted = len(text) - half * 2
+        return (
+            f"{text[:half]}\n...（输出过长，中间省略 {omitted} 个字符）...\n{text[-half:]}",
+            True,
+        )
+
     # --- 仪表盘 / 节点 ---
     @filter.llm_tool(name="mcsmanager_get_overview")
     async def mcsmanager_get_overview(self, event: AstrMessageEvent) -> str:
@@ -248,6 +597,181 @@ class MCSManagerFunction(Star):
         data = await self._request("GET", "/api/overview")
         remotes = data.get("data", {}).get("remote", [])
         return json.dumps(remotes, ensure_ascii=False, indent=2)
+
+    # --- 节点终端执行 ---
+    @filter.llm_tool(name="mcsmanager_node_bash")
+    async def mcsmanager_node_bash(
+        self,
+        event: AstrMessageEvent,
+        daemon_id: str,
+        command: str,
+        workdir: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> str:
+        """在节点（守护进程）所在主机上执行 bash 命令，返回标准输出/错误与退出码。
+        会将给定的命令保存到 .sh 中执行，因此支持多行脚本，适合一次性完成复杂任务。每次调用复用同一个节点终端 shell 会话，因此 cd、export 等状态会保留到下一次调用。
+        请注意，该 shell 为交互式，请确保执行过程中不弹出交互式操作，否则会导致卡住。首次执行可能稍慢，是正常情况。
+
+        Args:
+            daemon_id(string): 节点 ID。
+            command(string): 要执行的 bash 命令，支持多行脚本。
+            workdir(string, optional): 执行前切换到的目录（绝对路径），例如 "/opt/mcdr"。
+            timeout(int, optional): 超时秒数，默认取插件配置（30），范围 5~300。
+        """
+        if err := self._check_tool_permission(event, "mcsmanager_node_bash"):
+            return err
+        if err := self._check_blocked_daemon(daemon_id):
+            return err
+
+        command = (command or "").strip("\n")
+        if not command.strip():
+            return self._json_error("Empty command", "command 不能为空。")
+        if err := self._check_bash_command(command):
+            return err
+
+        limit = self._bash_timeout()
+        if timeout is not None:
+            try:
+                limit = max(5, min(int(timeout), 300))
+            except (TypeError, ValueError):
+                pass
+
+        lock = self._bash_locks.setdefault(daemon_id, asyncio.Lock())
+        async with lock:
+            return await self._execute_bash(
+                daemon_id, command, workdir, limit, event.get_sender_id()
+            )
+
+    async def _execute_bash(
+        self,
+        daemon_id: str,
+        command: str,
+        workdir: Optional[str],
+        limit: int,
+        sender_id: str,
+    ) -> str:
+        call_started = time.monotonic()
+        uuid, err, cold_started = await self._ensure_node_terminal(daemon_id)
+        if err:
+            return err
+        if cold_started:
+            # pty 的 bash 在初始化阶段会吞掉早到的输入，先探针叫醒再发真命令
+            ready, attempts = await self._probe_node_terminal(daemon_id, uuid)
+            if not ready:
+                return self._json_error(
+                    "Node terminal not ready",
+                    f"节点终端已启动，但连发 {attempts} 次探针都没有得到回显，"
+                    "可能是 daemon 的 pty helper 异常或 shell 启动失败。"
+                    "请在面板中手动打开该节点的「节点终端」确认它能正常执行命令。",
+                )
+            await asyncio.sleep(0.1)
+
+        token = uuid4().hex[:12]
+        script = self._build_bash_script(token, command, workdir)
+        started = time.monotonic()
+
+        runner, temp_target = "", ""
+        uploaded = await self._upload_script(daemon_id, uuid, token, script)
+        if uploaded is None:
+            # 文件接口不可用（权限/路径限制）：退回把脚本直接写进终端，
+            # 代价是 pty 模式会把命令原文回显进输出
+            if len(script) > BASH_INLINE_LIMIT:
+                return self._json_error(
+                    "Script upload failed",
+                    "命令过长（超过 "
+                    f"{BASH_INLINE_LIMIT} 字符），且写入节点临时脚本失败。"
+                    "请检查 API 密钥用户是否拥有该节点的文件读写权限，或将命令拆分为多次调用。",
+                )
+            runner = script
+        else:
+            runner, temp_target = uploaded
+
+        sent = await self._request(
+            "GET",
+            "/api/protected_instance/command",
+            params={"daemonId": daemon_id, "uuid": uuid, "command": runner},
+        )
+        if isinstance(sent, dict) and sent.get("error"):
+            if temp_target:
+                await self._delete_temp_script(daemon_id, uuid, temp_target)
+            return self._json_error(
+                "Send command failed",
+                f"向节点终端发送命令失败: {json.dumps(sent, ensure_ascii=False)}",
+            )
+
+        deadline = started + limit
+        output: Optional[str] = None
+        exit_code: Optional[int] = None
+        log_text = ""
+        terminal_alive = True
+        polls = 0
+        while time.monotonic() < deadline:
+            text = await self._read_node_terminal_log(daemon_id, uuid)
+            if text:
+                log_text = text
+                output, exit_code = self._extract_bash_result(text, token)
+                if output is not None:
+                    break
+            polls += 1
+            # 每 8 次轮询（约 2.4 秒）确认一次终端是否还活着，避免命令 exit 后干等超时
+            if polls % 8 == 0:
+                status, _ = await self._node_terminal_status(daemon_id, uuid)
+                if status is not None and status != INSTANCE_STATUS_RUNNING:
+                    terminal_alive = False
+                    break
+            await asyncio.sleep(0.3)
+
+        # 无论成功还是超时都清掉临时脚本：bash 已经打开该文件，unlink 不影响它继续执行
+        if temp_target:
+            await self._delete_temp_script(daemon_id, uuid, temp_target)
+
+        if output is None:
+            if terminal_alive:
+                detail = (
+                    f"命令在 {limit} 秒内没有产生结束标记：可能仍在执行（如 top、服务前台进程），"
+                    "或命令执行了 exit 导致节点终端退出。可增大 timeout 或改为后台执行。"
+                )
+            else:
+                detail = (
+                    "节点终端已不在运行状态，命令被中断（通常是命令里执行了 exit，或终端被面板停止）。"
+                    "下次调用会自动重新拉起节点终端。"
+                )
+            tail = (
+                self._clean_terminal_text(
+                    self._extract_partial_output(log_text, token)
+                )[-1500:]
+                if log_text
+                else ""
+            )
+            return json.dumps(
+                {
+                    "error": "Command not finished",
+                    "daemon_id": daemon_id,
+                    "detail": detail,
+                    "partial_output": tail,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        cleaned = self._clean_terminal_text(output)
+        truncated_text, truncated = self._truncate_output(cleaned, self._bash_max_output())
+        logger.info(
+            f"节点 bash 执行完成 daemon={daemon_id} exit={exit_code} "
+            f"耗时={time.monotonic() - call_started:.2f}s 用户={sender_id}"
+        )
+        return json.dumps(
+            {
+                "daemon_id": daemon_id,
+                "workdir": workdir or "",
+                "exit_code": exit_code,
+                "truncated": truncated,
+                "duration_seconds": round(time.monotonic() - call_started, 2),
+                "output": truncated_text,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # --- 实例管理 ---
     @filter.llm_tool(name="mcsmanager_get_instances")

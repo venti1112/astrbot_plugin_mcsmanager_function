@@ -3,7 +3,7 @@ MCSManagerFunction - AstrBot 插件
 
 简介
 ----
-本插件为 AstrBot 提供一系列 MCSManager 面板的工具函数，使 Agent 能够直接调用 MCSManager 的 API，实现实例管理、文件操作、日志查看等功能。
+本插件为 AstrBot 提供一系列 MCSManager 面板的工具函数，使 Agent 能够直接调用 MCSManager 的 API，实现实例管理、文件操作、日志查看、节点终端命令执行等功能。
 
 依赖
 ----
@@ -20,6 +20,9 @@ MCSManagerFunction - AstrBot 插件
 - api_token: MCSManager 的 API 密钥，在面板的用户管理中，在 "API 密钥" 中可以生成或查看。
 - tool_permissions: 为每个工具单独设置权限（「所有人」「仅管理员」「禁用」），默认「仅管理员」，详见「权限与限制」。
 - blocked_instances: 禁止操作的实例（UUID 或名称关键词），详见「权限与限制」。
+- bash_timeout: 节点命令的默认超时秒数（5~300，默认 30）。
+- bash_max_output: 节点命令返回的输出上限字符数（默认 8000，超出后保留首尾并截断中间）。
+- bash_blocked_commands: 禁止执行的命令规则（正则，忽略大小写；正则非法时按子串匹配），默认空。
 
 保存配置后，插件会自动连接并注册工具。
 
@@ -39,6 +42,20 @@ MCSManagerFunction - AstrBot 插件
 - 填写实例 UUID 或名称关键词（子串匹配，忽略大小写），每行一个。
 - 被列入的实例会从实例列表中隐藏，且拒绝一切针对它的操作（对管理员同样生效）。
 - 禁止名单非空时，针对实例的操作会先查询实例详情以解析名称，无法确认时保守拒绝。
+- 填写节点 ID 可封锁该节点：`mcsmanager_node_bash` 会直接拒绝在该节点上执行命令。
+
+节点命令黑名单（bash_blocked_commands）
+- 针对 `mcsmanager_node_bash`，每行一条规则，默认空（即不做命令级限制）。
+- 规则按正则匹配（忽略大小写），例如 `rm\s+-rf\s+/`、`^(reboot|shutdown)$`；正则非法时退化为子串匹配。
+- 命中规则的命令会在发给节点之前被拒绝，不会产生任何执行副作用。
+
+节点终端（mcsmanager_node_bash）的行为说明
+- 依赖面板的「节点终端」：daemon 侧是一个固定实例（UUID `global0001`，昵称 `__MCSM_GLOBAL_INSTANCE__`，启动命令 bash，默认 pty 模式）。
+- 终端未运行时插件会自动拉起；pty 下的 bash 在初始化阶段会吞掉早到的输入，所以冷启动后会先用无副作用的探针确认终端真的能执行命令，再发实际命令（冷启动约多花 1~2 秒）。
+- 每次执行的脚本都会先写入节点 `/tmp/mcsm_ai_<token>.sh`，再在终端里 `source` 它：pty 只会回显这一行，因此输出干净；`source` 在当前 shell 内执行，所以 `cd`、`export` 仍会跨调用保留。执行结束后脚本会被删除。
+- 若 API 密钥用户没有该节点的文件读写权限，会自动降级为把脚本直接写进终端（此时 pty 会把命令原文回显进输出）；超过 3500 字符的命令无法降级，会直接报错要求拆分。
+- 输出通过「打印起止标记 + 轮询终端日志」的方式捕获，因此不支持交互式命令（如 `vim`、`top`、需要 stdin 的 `read`）。需要长驻进程请自行 `nohup ... &`。
+- 命令里执行 `exit` 会让节点终端退出，下次调用会自动重新拉起。
 
 删除保护
 - mcsmanager_delete_files 始终拒绝删除实例根目录（空路径、"/"、"." 等目标）。
@@ -51,6 +68,8 @@ MCSManagerFunction - AstrBot 插件
   "查看所有实例列表"
   "获取实例日志"
   "列出游戏服务器文件"
+  "在这个节点上建个 python 虚拟环境，把 MCDR 部署到实例目录"
+  "实例卡住了，dump 一下 java 堆栈看看"
 
 工具列表
 --------
@@ -61,6 +80,12 @@ MCSManagerFunction - AstrBot 插件
   获取面板全局概览（版本、CPU、内存、节点状态等）
 - mcsmanager_get_daemon_list
   获取所有已连接节点列表及基本状态
+
+节点终端
+- mcsmanager_node_bash
+  在节点主机上执行 bash 命令，返回输出与退出码（详见「节点终端的行为说明」）
+  参数：daemon_id, command, workdir(可选，绝对路径), timeout(可选，5~300 秒)
+  示例：创建虚拟环境 `python3 -m venv .venv`、部署 MCDR、用 `jstack`/`top` 诊断整合包卡顿
 
 实例管理
 - mcsmanager_get_instances
@@ -114,6 +139,10 @@ MCSManagerFunction - AstrBot 插件
 - mcsmanager_move_files
   移动或重命名文件/文件夹
   参数：daemon_id, uuid, targets(二维列表)
+
+更新日志
+--------
+各版本的变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 致谢
 ----
